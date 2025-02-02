@@ -130,6 +130,25 @@ def init_database():
             FOREIGN KEY (asset_id) REFERENCES assets (asset_id)
         )
     """)
+    
+    # Create movement table
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS movement_requests (
+            request_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            asset_id INTEGER,
+            requester_id INTEGER,
+            current_department TEXT,
+            requested_department TEXT,
+            requested_date DATE,
+            reason TEXT,
+            status TEXT CHECK(status IN ('pending', 'approved', 'rejected')),
+            approved_by INTEGER,
+            approved_date DATETIME,
+            FOREIGN KEY (asset_id) REFERENCES assets (asset_id),
+            FOREIGN KEY (requester_id) REFERENCES users (user_id),
+            FOREIGN KEY (approved_by) REFERENCES users (user_id)
+        )
+    """)
 
     # Create default admin user if not exists
     default_password = "admin123"
@@ -449,9 +468,7 @@ def show_add_asset_form():
     description = st.text_area("Description")
 
     if st.button("Add Asset"):
-        if not all(
-            [asset_name, asset_type, department, acquisition_date, original_value]
-        ):
+        if not all([asset_name, asset_type, department, acquisition_date, original_value]):
             st.error("Please fill in all required fields marked with *")
             return
 
@@ -459,10 +476,24 @@ def show_add_asset_form():
             conn = get_database_connection()
             c = conn.cursor()
 
-            # Get depreciation rate and method based on asset type
-            dep_rate, dep_method = get_asset_type_depreciation_rate(asset_type)
+            # Get saved depreciation rules for this asset type
+            c.execute("""
+                SELECT DISTINCT depreciation_rate, depreciation_method
+                FROM assets 
+                WHERE asset_type = ?
+                GROUP BY asset_type
+            """, (asset_type,))
+            
+            saved_rule = c.fetchone()
+            
+            if saved_rule:
+                # Use saved depreciation rules
+                dep_rate, dep_method = saved_rule
+            else:
+                # Fallback to default rules if no saved rules exist
+                dep_rate, dep_method = get_asset_type_depreciation_rate(asset_type)
 
-            # Calculate initial current value
+            # Calculate initial current value using the rules
             current_value = calculate_depreciation(
                 original_value,
                 dep_rate,
@@ -470,7 +501,7 @@ def show_add_asset_form():
                 dep_method,
             )
 
-            # Insert new asset
+            # Insert new asset with the applied rules
             c.execute(
                 """
                 INSERT INTO assets (
@@ -507,7 +538,9 @@ def show_add_asset_form():
             )
 
             conn.commit()
-            st.success("Asset added successfully!")
+            st.success(f"""Asset added successfully! 
+                         Applied {dep_rate}% {dep_method} depreciation rate 
+                         based on saved rules.""")
 
         except sqlite3.Error as e:
             st.error(f"An error occurred: {e}")
@@ -2321,18 +2354,305 @@ def restore_backup(backup_file):
         backup_conn.close()
         conn.close()
         os.remove(temp_file)
+        
+        
+# Role-based permissions and access control
+
+ROLE_PERMISSIONS = {
+    "admin": {
+        "description": "Full system administrator access",
+        "permissions": {
+            "assets": ["view", "create", "edit", "delete", "approve"],
+            "transactions": ["view", "create", "approve", "bulk_transfer"],
+            "maintenance": ["view", "schedule", "complete", "approve"],
+            "reports": ["view", "create", "export", "custom"],
+            "users": ["view", "create", "edit", "delete"],
+            "settings": ["view", "edit"],
+            "audit": ["view", "export"],
+            "movement_requests": ["view", "approve", "reject", "create"]
+        }
+    },
+    "management": {
+        "description": "Department management access",
+        "permissions": {
+            "assets": ["view", "edit", "approve"],
+            "transactions": ["view", "approve"],
+            "maintenance": ["view", "approve"],
+            "reports": ["view", "export"],
+            "audit": ["view"],
+            "movement_requests": ["view", "approve", "reject"]
+        }
+    },
+    "staff": {
+        "description": "Regular staff access",
+        "permissions": {
+            "assets": ["view_assigned"],
+            "transactions": ["view_assigned"],
+            "maintenance": ["view_assigned", "request"],
+            "reports": ["view_basic"],
+            "movement_requests": ["create", "view_own"]
+        }
+    }
+}
+
+def check_permission(required_permission, module):
+    """Check if current user has required permission for the module"""
+    if not st.session_state.logged_in:
+        return False
+    
+    user_role = st.session_state.user_role
+    user_permissions = ROLE_PERMISSIONS.get(user_role, {}).get("permissions", {})
+    module_permissions = user_permissions.get(module, [])
+    
+    return required_permission in module_permissions
+
+def init_movement_table(conn):
+    """Initialize movement requests table"""
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS movement_requests (
+            request_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            asset_id INTEGER,
+            requester_id INTEGER,
+            current_department TEXT,
+            requested_department TEXT,
+            requested_date DATE,
+            reason TEXT,
+            status TEXT CHECK(status IN ('pending', 'approved', 'rejected')),
+            approved_by INTEGER,
+            approved_date DATETIME,
+            FOREIGN KEY (asset_id) REFERENCES assets (asset_id),
+            FOREIGN KEY (requester_id) REFERENCES users (user_id),
+            FOREIGN KEY (approved_by) REFERENCES users (user_id)
+        )
+    """)
+    conn.commit()
+
+def show_movement_request_form(get_user_department, get_user_id):
+    """Form for staff to request asset movement/transfer"""
+    st.subheader("Request Asset Movement")
+    
+    if not check_permission("create", "movement_requests"):
+        st.error("You don't have permission to create movement requests.")
+        return
+    
+    conn = get_database_connection()
+    
+    # Get assets assigned to current user's department
+    user_dept = get_user_department(st.session_state.username)
+    assigned_assets = pd.read_sql_query("""
+        SELECT asset_id, asset_name 
+        FROM assets 
+        WHERE department = ? AND status = 'active'
+    """, conn, params=[user_dept])
+    
+    if assigned_assets.empty:
+        st.warning("No assets available for movement request.")
+        return
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        asset_id = st.selectbox(
+            "Select Asset",
+            options=assigned_assets['asset_id'].tolist(),
+            format_func=lambda x: assigned_assets[
+                assigned_assets['asset_id'] == x
+            ]['asset_name'].iloc[0]
+        )
+        new_department = st.text_input("Requested Department")
+    
+    with col2:
+        requested_date = st.date_input("Requested Date")
+        reason = st.text_area("Reason for Movement")
+    
+    if st.button("Submit Request"):
+        try:
+            c = conn.cursor()
+            c.execute("""
+                INSERT INTO movement_requests (
+                    asset_id, requester_id, current_department,
+                    requested_department, requested_date, reason, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                asset_id,
+                get_user_id(st.session_state.username),
+                user_dept,
+                new_department,
+                requested_date.strftime('%Y-%m-%d'),
+                reason,
+                'pending'
+            ))
+            
+            conn.commit()
+            st.success("Movement request submitted successfully!")
+            
+        except sqlite3.Error as e:
+            st.error(f"Error submitting request: {e}")
+        finally:
+            conn.close()
+
+
+def show_movement_request_form(get_user_department, get_user_id):
+    """Form for staff to request asset movement/transfer"""
+    st.subheader("Request Asset Movement")
+    
+    if not check_permission("create", "movement_requests"):
+        st.error("You don't have permission to create movement requests.")
+        return
+    
+    conn = get_database_connection()
+    
+    # Get assets assigned to current user's department
+    user_dept = get_user_department(st.session_state.username)
+    assigned_assets = pd.read_sql_query("""
+        SELECT asset_id, asset_name 
+        FROM assets 
+        WHERE department = ? AND status = 'active'
+    """, conn, params=[user_dept])
+    
+    if assigned_assets.empty:
+        st.warning("No assets available for movement request.")
+        return
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        asset_id = st.selectbox(
+            "Select Asset",
+            options=assigned_assets['asset_id'].tolist(),
+            format_func=lambda x: assigned_assets[
+                assigned_assets['asset_id'] == x
+            ]['asset_name'].iloc[0]
+        )
+        new_department = st.text_input("Requested Department")
+    
+    with col2:
+        requested_date = st.date_input("Requested Date")
+        reason = st.text_area("Reason for Movement")
+    
+    if st.button("Submit Request"):
+        try:
+            c = conn.cursor()
+            c.execute("""
+                INSERT INTO movement_requests (
+                    asset_id, requester_id, current_department,
+                    requested_department, requested_date, reason, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                asset_id,
+                get_user_id(st.session_state.username),
+                user_dept,
+                new_department,
+                requested_date.strftime('%Y-%m-%d'),
+                reason,
+                'pending'
+            ))
+            
+            conn.commit()
+            st.success("Movement request submitted successfully!")
+            
+        except sqlite3.Error as e:
+            st.error(f"Error submitting request: {e}")
+        finally:
+            conn.close()
+
+
+def approve_movement_request(request_id, get_user_id):
+    """Approve an asset movement request"""
+    if not check_permission("approve", "movement_requests"):
+        return
+    
+    conn = get_database_connection()
+    c = conn.cursor()
+    
+    try:
+        c.execute("BEGIN TRANSACTION")
+        
+        # Get request details
+        c.execute("""
+            SELECT asset_id, requested_department
+            FROM movement_requests
+            WHERE request_id = ?
+        """, (request_id,))
+        
+        request = c.fetchone()
+        if not request:
+            raise ValueError("Request not found")
+        
+        # Update asset department
+        c.execute("""
+            UPDATE assets
+            SET department = ?
+            WHERE asset_id = ?
+        """, (request[1], request[0]))
+        
+        # Update request status
+        c.execute("""
+            UPDATE movement_requests
+            SET status = 'approved',
+                approved_by = ?,
+                approved_date = CURRENT_TIMESTAMP
+            WHERE request_id = ?
+        """, (get_user_id(st.session_state.username), request_id))
+        
+        # Log the action
+        c.execute("""
+            INSERT INTO audit_logs (action, user_id, asset_id)
+            VALUES (?, ?, ?)
+        """, (
+            "Movement request approved",
+            get_user_id(st.session_state.username),
+            request[0]
+        ))
+        
+        c.execute("COMMIT")
+        st.success("Movement request approved successfully!")
+        
+    except Exception as e:
+        c.execute("ROLLBACK")
+        st.error(f"Error approving request: {e}")
+    finally:
+        conn.close()
+
+def reject_movement_request(request_id, get_user_id):
+    """Reject an asset movement request"""
+    if not check_permission("reject", "movement_requests"):
+        return
+    
+    conn = get_database_connection()
+    c = conn.cursor()
+    
+    try:
+        c.execute("""
+            UPDATE movement_requests
+            SET status = 'rejected',
+                approved_by = ?,
+                approved_date = CURRENT_TIMESTAMP
+            WHERE request_id = ?
+        """, (get_user_id(st.session_state.username), request_id))
+        
+        conn.commit()
+        st.success("Movement request rejected.")
+        
+    except sqlite3.Error as e:
+        conn.rollback()
+        st.error(f"Error rejecting request: {e}")
+    finally:
+        conn.close()
 
 
 # Main application structure
 def show_main_application():
     st.sidebar.title(f"Welcome, {st.session_state.username}")
 
-    # Sidebar navigation
+    # Updated navigation with Movement Requests
     menu_options = {
         "Dashboard": "📊",
         "Asset Management": "💼",
         "Transactions": "🔄",
         "Maintenance": "🔧",
+        "Movement Requests": "🔄",  # Added Movement Requests
         "Reports": "📈",
         "Settings": "⚙️",
     }
@@ -2352,7 +2672,7 @@ def show_main_application():
         st.session_state.user_role = None
         st.rerun()
 
-    # Page routing
+    # Updated page routing
     if selected_page == "Dashboard":
         show_dashboard()
     elif selected_page == "Asset Management":
@@ -2361,15 +2681,279 @@ def show_main_application():
         show_transactions()
     elif selected_page == "Maintenance":
         show_maintenance()
+    elif selected_page == "Movement Requests":
+        show_movement_requests_page()
     elif selected_page == "Reports":
         show_reports()
     elif selected_page == "Settings":
         show_settings()
     elif selected_page == "User Management" and st.session_state.user_role == "admin":
-        show_user_management()
-
+        show_user_management()  
+        
+        
 
 # Placeholder functions for different pages
+def show_movement_requests_page():
+    st.title("🔄 Movement Requests")
+    
+    # Different views based on user role
+    if st.session_state.user_role in ["admin", "management"]:
+        tabs = st.tabs(["Pending Requests", "Request History", "New Request"])
+    else:
+        tabs = st.tabs(["My Requests", "New Request"])
+    
+    if st.session_state.user_role in ["admin", "management"]:
+        with tabs[0]:
+            show_pending_requests()
+        with tabs[1]:
+            show_request_history()
+        with tabs[2]:
+            show_movement_request_form_updated()
+    else:
+        with tabs[0]:
+            show_my_requests()
+        with tabs[1]:
+            show_movement_request_form_updated()
+            
+            
+def show_movement_request_form_updated():
+    """Updated form for staff to request asset movement/transfer"""
+    st.subheader("Request Asset Movement")
+    
+    if not check_permission("create", "movement_requests"):
+        st.error("You don't have permission to create movement requests.")
+        return
+    
+    conn = get_database_connection()
+    
+    # Get assets assigned to current user's department
+    user_dept = get_user_department(st.session_state.username)
+    assigned_assets = pd.read_sql_query("""
+        SELECT asset_id, asset_name 
+        FROM assets 
+        WHERE department = ? AND status = 'active'
+    """, conn, params=[user_dept])
+    
+    if assigned_assets.empty:
+        st.warning("No assets available for movement request.")
+        return
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        asset_id = st.selectbox(
+            "Select Asset",
+            options=assigned_assets['asset_id'].tolist(),
+            format_func=lambda x: assigned_assets[
+                assigned_assets['asset_id'] == x
+            ]['asset_name'].iloc[0]
+        )
+        new_department = st.text_input("Requested Department")
+    
+    with col2:
+        requested_date = st.date_input("Requested Date")
+        reason = st.text_area("Reason for Movement")
+    
+    if st.button("Submit Request"):
+        try:
+            c = conn.cursor()
+            c.execute("""
+                INSERT INTO movement_requests (
+                    asset_id, requester_id, current_department,
+                    requested_department, requested_date, reason, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                asset_id,
+                get_user_id(st.session_state.username),
+                user_dept,
+                new_department,
+                requested_date.strftime('%Y-%m-%d'),
+                reason,
+                'pending'
+            ))
+            
+            conn.commit()
+            st.success("Movement request submitted successfully!")
+            
+        except sqlite3.Error as e:
+            st.error(f"Error submitting request: {e}")
+        finally:
+            conn.close()
+
+def show_pending_requests():
+    st.subheader("Pending Movement Requests")
+    
+    if not check_permission("approve", "movement_requests"):
+        st.error("You don't have permission to view pending requests.")
+        return
+    
+    conn = get_database_connection()
+    df = pd.read_sql_query("""
+        SELECT 
+            mr.request_id,
+            a.asset_name,
+            u.username as requester,
+            mr.current_department,
+            mr.requested_department,
+            mr.requested_date,
+            mr.reason,
+            mr.status
+        FROM movement_requests mr
+        JOIN assets a ON mr.asset_id = a.asset_id
+        JOIN users u ON mr.requester_id = u.user_id
+        WHERE mr.status = 'pending'
+        ORDER BY mr.requested_date DESC
+    """, conn)
+    
+    if not df.empty:
+        for _, request in df.iterrows():
+            with st.expander(
+                f"{request['asset_name']}: {request['current_department']} → "
+                f"{request['requested_department']}"
+            ):
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.write(f"**Requester:** {request['requester']}")
+                    st.write(f"**Requested Date:** {request['requested_date']}")
+                    st.write(f"**Reason:** {request['reason']}")
+                
+                with col2:
+                    if st.button("Approve", key=f"approve_{request['request_id']}"):
+                        approve_movement_request(request['request_id'])
+                        st.rerun()
+                    if st.button("Reject", key=f"reject_{request['request_id']}"):
+                        reject_movement_request(request['request_id'])
+                        st.rerun()
+    else:
+        st.info("No pending requests.")
+    
+    conn.close()
+
+def show_my_requests():
+    st.subheader("My Movement Requests")
+    
+    conn = get_database_connection()
+    df = pd.read_sql_query("""
+        SELECT 
+            mr.request_id,
+            a.asset_name,
+            mr.current_department,
+            mr.requested_department,
+            mr.requested_date,
+            mr.reason,
+            mr.status,
+            u2.username as approved_by,
+            mr.approved_date
+        FROM movement_requests mr
+        JOIN assets a ON mr.asset_id = a.asset_id
+        LEFT JOIN users u2 ON mr.approved_by = u2.user_id
+        WHERE mr.requester_id = ?
+        ORDER BY mr.requested_date DESC
+    """, conn, params=[get_user_id(st.session_state.username)])
+    
+    if not df.empty:
+        for _, request in df.iterrows():
+            with st.expander(
+                f"{request['asset_name']} - {request['status'].title()}"
+            ):
+                st.write(f"**From:** {request['current_department']}")
+                st.write(f"**To:** {request['requested_department']}")
+                st.write(f"**Requested Date:** {request['requested_date']}")
+                st.write(f"**Status:** {request['status'].title()}")
+                if request['approved_by']:
+                    st.write(f"**Processed by:** {request['approved_by']}")
+                    st.write(f"**Processed Date:** {request['approved_date']}")
+                st.write("**Reason:**")
+                st.write(request['reason'])
+    else:
+        st.info("No movement requests found.")
+    
+    conn.close()
+
+def show_request_history():
+    st.subheader("Movement Request History")
+    
+    # Filters
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        date_range = st.date_input(
+            "Date Range",
+            value=(datetime.now() - timedelta(days=30), datetime.now())
+        )
+    
+    with col2:
+        status_filter = st.selectbox(
+            "Status",
+            ["All", "pending", "approved", "rejected"]
+        )
+    
+    with col3:
+        department_filter = st.selectbox(
+            "Department",
+            ["All"] + get_departments()
+        )
+    
+    # Fetch filtered data
+    conn = get_database_connection()
+    query = """
+        SELECT 
+            mr.request_id,
+            a.asset_name,
+            u1.username as requester,
+            mr.current_department,
+            mr.requested_department,
+            mr.requested_date,
+            mr.status,
+            u2.username as approved_by,
+            mr.approved_date
+        FROM movement_requests mr
+        JOIN assets a ON mr.asset_id = a.asset_id
+        JOIN users u1 ON mr.requester_id = u1.user_id
+        LEFT JOIN users u2 ON mr.approved_by = u2.user_id
+        WHERE mr.requested_date BETWEEN ? AND ?
+    """
+    params = [date_range[0], date_range[1]]
+    
+    if status_filter != "All":
+        query += " AND mr.status = ?"
+        params.append(status_filter)
+    
+    if department_filter != "All":
+        query += " AND (mr.current_department = ? OR mr.requested_department = ?)"
+        params.extend([department_filter, department_filter])
+    
+    df = pd.read_sql_query(query, conn, params=params)
+    
+    if not df.empty:
+        st.dataframe(df, hide_index=True)
+        
+        if st.button("Export to Excel"):
+            output = BytesIO()
+            with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                df.to_excel(writer, index=False)
+            
+            st.download_button(
+                label="Download Excel file",
+                data=output.getvalue(),
+                file_name="movement_requests_history.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+    else:
+        st.info("No movement requests found for the selected criteria.")
+    
+    conn.close()
+
+def get_user_department(username):
+    """Get department of a user"""
+    conn = get_database_connection()
+    c = conn.cursor()
+    c.execute("SELECT department FROM users WHERE username = ?", (username,))
+    result = c.fetchone()
+    conn.close()
+    return result[0] if result else None
+
 def show_dashboard():
     # Custom CSS for better styling
     st.markdown("""
@@ -2790,61 +3374,141 @@ def show_edit_asset_form(asset_id):
     conn = get_database_connection()
     c = conn.cursor()
     
-    # Get asset details
+    # Get asset details with proper row factory
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    
     c.execute("""
-        SELECT * FROM assets WHERE asset_id = ?
+        SELECT 
+            a.*,
+            l.location_name
+        FROM assets a
+        LEFT JOIN locations l ON a.location_id = l.location_id
+        WHERE a.asset_id = ?
     """, (asset_id,))
+    
     asset = c.fetchone()
     
     if asset:
         st.subheader(f"Edit Asset: {asset['asset_name']}")
         
-        col1, col2 = st.columns(2)
+        # Create three columns for the form
+        col1, col2, col3 = st.columns(3)
         
         with col1:
             new_name = st.text_input("Asset Name", value=asset['asset_name'])
-            new_type = st.selectbox("Asset Type", get_asset_types(), 
-                                  index=get_asset_types().index(asset['asset_type']))
-            new_status = st.selectbox("Status", 
-                                    ["active", "inactive", "disposed", "transferred"],
-                                    index=["active", "inactive", "disposed", "transferred"].index(asset['status']))
+            new_type = st.selectbox(
+                "Asset Type", 
+                get_asset_types(),
+                index=get_asset_types().index(asset['asset_type'])
+            )
+            new_brand = st.text_input("Brand", value=asset['brand'] or "")
+            new_serial = st.text_input("Serial Number", value=asset['serial_number'] or "")
         
         with col2:
-            new_department = st.text_input("Department", value=asset['department'])
-            new_location = st.selectbox("Location", get_locations(), 
-                                      index=get_locations().index(asset['location_id']))
-            new_value = st.number_input("Current Value", 
-                                      value=float(asset['current_value']))
+            new_department = st.text_input("Department", value=asset['department'] or "")
+            new_location = st.selectbox(
+                "Location", 
+                get_locations(),
+                index=get_locations().index(asset['location_id']) if asset['location_id'] else 0
+            )
+            new_status = st.selectbox(
+                "Status", 
+                ["active", "inactive", "disposed", "transferred"],
+                index=["active", "inactive", "disposed", "transferred"].index(asset['status'])
+            )
+            new_value = st.number_input(
+                "Current Value", 
+                min_value=0.0,
+                value=float(asset['current_value'])
+            )
         
-        if st.button("Update Asset"):
+        with col3:
+            # Display depreciation information directly in the third column
+            st.markdown("### Depreciation Information")
+            st.metric(
+                "Original Value",
+                f"${asset['original_value']:,.2f}"
+            )
+            st.metric(
+                "Current Value",
+                f"${asset['current_value']:,.2f}"
+            )
+            st.metric(
+                "Depreciation Rate",
+                f"{asset['depreciation_rate']}%"
+            )
+            st.metric(
+                "Depreciation Method",
+                asset['depreciation_method']
+            )
+        
+        # Full-width description field
+        new_description = st.text_area(
+            "Description", 
+            value=asset['description'] or "",
+            height=100
+        )
+        
+        # Create two columns for the action buttons
+        button_col1, button_col2 = st.columns(2)
+        
+        with button_col1:
+            update_button = st.button("Update Asset", type="primary", use_container_width=True)
+        
+        with button_col2:
+            cancel_button = st.button("Cancel", use_container_width=True)
+        
+        if update_button:
             try:
+                # Update asset information
                 c.execute("""
                     UPDATE assets
                     SET asset_name = ?,
                         asset_type = ?,
-                        status = ?,
+                        brand = ?,
+                        serial_number = ?,
                         department = ?,
                         location_id = ?,
+                        status = ?,
+                        description = ?,
                         current_value = ?
                     WHERE asset_id = ?
-                """, (new_name, new_type, new_status, new_department, 
-                     new_location, new_value, asset_id))
+                """, (
+                    new_name, new_type, new_brand, new_serial,
+                    new_department, new_location, new_status,
+                    new_description, new_value, asset_id
+                ))
+                
+                # Log the update
+                c.execute("""
+                    INSERT INTO audit_logs (action, user_id, asset_id)
+                    VALUES (?, ?, ?)
+                """, (
+                    "Asset updated",
+                    get_user_id(st.session_state.username),
+                    asset_id
+                ))
                 
                 conn.commit()
                 st.success("Asset updated successfully!")
                 
-                # Log the action
-                c.execute("""
-                    INSERT INTO audit_logs (action, user_id, asset_id)
-                    VALUES (?, ?, ?)
-                """, ("Asset modified", get_user_id(st.session_state.username), asset_id))
-                
-                conn.commit()
+                # Add refresh button after successful update
+                if st.button("Refresh View"):
+                    st.rerun()
                 
             except sqlite3.Error as e:
                 st.error(f"An error occurred: {e}")
+                conn.rollback()
             finally:
                 conn.close()
+        
+        elif cancel_button:
+            st.rerun()
+            
+    else:
+        st.error("Asset not found")
+        conn.close()
 
 def delete_asset(asset_id):
     if st.session_state.user_role != "admin":
@@ -3009,69 +3673,7 @@ def show_bulk_import():
         except Exception as e:
             st.error(f"Error processing file: {str(e)}")
 
-def show_edit_asset_form(asset_id):
-    conn = get_database_connection()
-    c = conn.cursor()
-    
-    # Get asset details
-    c.execute("""
-        SELECT * FROM assets WHERE asset_id = ?
-    """, (asset_id,))
-    asset = c.fetchone()
-    
-    if asset:
-        st.subheader(f"Edit Asset: {asset['asset_name']}")
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            new_name = st.text_input("Asset Name", value=asset['asset_name'])
-            new_type = st.selectbox("Asset Type", get_asset_types(), 
-                                  index=get_asset_types().index(asset['asset_type']))
-            new_brand = st.text_input("Brand", value=asset['brand'])
-            new_serial = st.text_input("Serial Number", value=asset['serial_number'])
-        
-        with col2:
-            new_department = st.text_input("Department", value=asset['department'])
-            new_location = st.selectbox("Location", get_locations(), 
-                                      index=get_locations().index(asset['location_id']))
-            new_status = st.selectbox("Status", 
-                                    ["active", "inactive", "disposed", "transferred"],
-                                    index=["active", "inactive", "disposed", "transferred"].index(asset['status']))
-        
-        new_description = st.text_area("Description", value=asset['description'])
-        new_value = st.number_input("Current Value", value=float(asset['current_value']))
-        
-        if st.button("Update Asset"):
-            try:
-                c.execute("""
-                    UPDATE assets
-                    SET asset_name = ?,
-                        asset_type = ?,
-                        brand = ?,
-                        serial_number = ?,
-                        department = ?,
-                        location_id = ?,
-                        status = ?,
-                        description = ?,
-                        current_value = ?
-                    WHERE asset_id = ?
-                """, (new_name, new_type, new_brand, new_serial, new_department,
-                     new_location, new_status, new_description, new_value, asset_id))
-                
-                # Log the update
-                c.execute("""
-                    INSERT INTO audit_logs (action, user_id, asset_id)
-                    VALUES (?, ?, ?)
-                """, ("Asset updated", get_user_id(st.session_state.username), asset_id))
-                
-                conn.commit()
-                st.success("Asset updated successfully!")
-                
-            except sqlite3.Error as e:
-                st.error(f"An error occurred: {e}")
-            finally:
-                conn.close()
+
 
 def show_transactions():
     st.title("🔄 Transaction Management")
@@ -3341,6 +3943,318 @@ def show_bulk_transfer_form():
                 conn.close()
 
 
+def init_land_building_tables(conn):
+    """Initialize separate tables for land and buildings"""
+    c = conn.cursor()
+    
+    # Create land assets table
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS land_assets (
+            land_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            asset_id INTEGER UNIQUE,
+            land_area REAL,
+            land_value REAL,
+            location_details TEXT,
+            FOREIGN KEY (asset_id) REFERENCES assets (asset_id)
+        )
+    """)
+    
+    # Create building assets table
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS building_assets (
+            building_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            asset_id INTEGER UNIQUE,
+            building_area REAL,
+            building_value REAL,
+            construction_year INTEGER,
+            useful_life INTEGER,
+            FOREIGN KEY (asset_id) REFERENCES assets (asset_id)
+        )
+    """)
+    
+    # Modify asset types in assets table
+    c.execute("""
+        ALTER TABLE assets DROP CONSTRAINT IF EXISTS asset_type_check
+    """)
+    
+    c.execute("""
+        ALTER TABLE assets ADD CONSTRAINT asset_type_check 
+        CHECK(asset_type IN (
+            'Land', 'Building', 'Motor Vehicle', 'Computer & Accessories',
+            'Office Equipment', 'Furniture & Fittings', 'Intangible Assets',
+            'Legacy Assets', 'Other Assets'
+        ))
+    """)
+
+def calculate_property_depreciation(
+    building_value, 
+    land_value, 
+    depreciation_rate, 
+    acquisition_date, 
+    method="Straight-Line"
+):
+    """Calculate depreciation for property assets (land doesn't depreciate)"""
+    years = (datetime.now() - datetime.strptime(acquisition_date, "%Y-%m-%d")).days / 365.25
+    
+    # Land value remains constant
+    if method == "Straight-Line":
+        building_depreciation = building_value * (depreciation_rate / 100) * years
+        current_building_value = max(0, building_value - building_depreciation)
+    else:  # Reducing Balance
+        current_building_value = building_value * ((1 - depreciation_rate / 100) ** years)
+    
+    # Total current value is depreciated building value plus original land value
+    total_current_value = current_building_value + land_value
+    return total_current_value, current_building_value
+
+def add_property_asset(
+    conn,
+    asset_name,
+    description,
+    location_id,
+    department,
+    acquisition_date,
+    land_details,
+    building_details=None
+):
+    """Add a new property asset with separate land and building components"""
+    c = conn.cursor()
+    
+    try:
+        # Start transaction
+        c.execute("BEGIN TRANSACTION")
+        
+        # Insert main asset record
+        c.execute("""
+            INSERT INTO assets (
+                asset_name,
+                asset_type,
+                description,
+                acquisition_date,
+                status,
+                location_id,
+                department,
+                current_value,
+                original_value,
+                depreciation_rate,
+                depreciation_method
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            asset_name,
+            'Land' if building_details is None else 'Building',
+            description,
+            acquisition_date,
+            'active',
+            location_id,
+            department,
+            land_details['value'] + (building_details['value'] if building_details else 0),
+            land_details['value'] + (building_details['value'] if building_details else 0),
+            2.0 if building_details else 0.0,  # 2% for buildings, 0% for land
+            'Straight-Line'
+        ))
+        
+        asset_id = c.lastrowid
+        
+        # Insert land details
+        c.execute("""
+            INSERT INTO land_assets (
+                asset_id,
+                land_area,
+                land_value,
+                location_details
+            ) VALUES (?, ?, ?, ?)
+        """, (
+            asset_id,
+            land_details['area'],
+            land_details['value'],
+            land_details['location_details']
+        ))
+        
+        # Insert building details if provided
+        if building_details:
+            c.execute("""
+                INSERT INTO building_assets (
+                    asset_id,
+                    building_area,
+                    building_value,
+                    construction_year,
+                    useful_life
+                ) VALUES (?, ?, ?, ?, ?)
+            """, (
+                asset_id,
+                building_details['area'],
+                building_details['value'],
+                building_details['construction_year'],
+                building_details['useful_life']
+            ))
+        
+        c.execute("""
+            INSERT INTO audit_logs (action, asset_id, timestamp)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+        """, (
+            'Property asset created',
+            asset_id
+        ))
+        
+        # Commit transaction
+        c.execute("COMMIT")
+        return asset_id
+        
+    except Exception as e:
+        c.execute("ROLLBACK")
+        raise e
+
+def get_property_details(conn, asset_id):
+    """Get detailed information about a property asset"""
+    c = conn.cursor()
+    
+    # Get main asset details
+    c.execute("""
+        SELECT 
+            a.*,
+            l.land_area,
+            l.land_value,
+            l.location_details,
+            b.building_area,
+            b.building_value,
+            b.construction_year,
+            b.useful_life
+        FROM assets a
+        JOIN land_assets l ON a.asset_id = l.asset_id
+        LEFT JOIN building_assets b ON a.asset_id = b.asset_id
+        WHERE a.asset_id = ?
+    """, (asset_id,))
+    
+    result = c.fetchone()
+    if not result:
+        return None
+    
+    # Calculate current values
+    if result['asset_type'] == 'Building':
+        current_total, current_building = calculate_property_depreciation(
+            result['building_value'],
+            result['land_value'],
+            result['depreciation_rate'],
+            result['acquisition_date']
+        )
+        
+        return {
+            'asset_id': result['asset_id'],
+            'asset_name': result['asset_name'],
+            'asset_type': result['asset_type'],
+            'description': result['description'],
+            'acquisition_date': result['acquisition_date'],
+            'status': result['status'],
+            'land': {
+                'area': result['land_area'],
+                'value': result['land_value'],
+                'location_details': result['location_details']
+            },
+            'building': {
+                'area': result['building_area'],
+                'original_value': result['building_value'],
+                'current_value': current_building,
+                'construction_year': result['construction_year'],
+                'useful_life': result['useful_life']
+            },
+            'total_current_value': current_total,
+            'total_original_value': result['land_value'] + result['building_value']
+        }
+    else:
+        return {
+            'asset_id': result['asset_id'],
+            'asset_name': result['asset_name'],
+            'asset_type': 'Land',
+            'description': result['description'],
+            'acquisition_date': result['acquisition_date'],
+            'status': result['status'],
+            'land': {
+                'area': result['land_area'],
+                'value': result['land_value'],
+                'location_details': result['location_details']
+            },
+            'total_current_value': result['land_value'],
+            'total_original_value': result['land_value']
+        }
+
+def show_property_form():
+    """Display form for adding/editing property assets"""
+    st.subheader("Property Asset Details")
+    
+    # Land Details
+    st.write("### Land Details")
+    land_area = st.number_input("Land Area (sq. meters)", min_value=0.0)
+    land_value = st.number_input("Land Value", min_value=0.0)
+    land_location = st.text_area("Location Details")
+    
+    # Building Details
+    has_building = st.checkbox("Include Building")
+    building_details = None
+    
+    if has_building:
+        st.write("### Building Details")
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            building_area = st.number_input("Building Area (sq. meters)", min_value=0.0)
+            building_value = st.number_input("Building Value", min_value=0.0)
+        
+        with col2:
+            construction_year = st.number_input(
+                "Construction Year", 
+                min_value=1900, 
+                max_value=datetime.now().year
+            )
+            useful_life = st.number_input("Useful Life (years)", min_value=1, value=50)
+        
+        building_details = {
+            'area': building_area,
+            'value': building_value,
+            'construction_year': construction_year,
+            'useful_life': useful_life
+        }
+    
+    # Common Details
+    st.write("### General Information")
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        asset_name = st.text_input("Asset Name*")
+        department = st.text_input("Department*")
+    
+    with col2:
+        location_id = st.selectbox("Location*", get_locations())
+        acquisition_date = st.date_input("Acquisition Date*")
+    
+    description = st.text_area("Description")
+    
+    if st.button("Save Property Asset"):
+        try:
+            conn = get_database_connection()
+            
+            land_details = {
+                'area': land_area,
+                'value': land_value,
+                'location_details': land_location
+            }
+            
+            asset_id = add_property_asset(
+                conn,
+                asset_name,
+                description,
+                location_id,
+                department,
+                acquisition_date.strftime('%Y-%m-%d'),
+                land_details,
+                building_details
+            )
+            
+            st.success(f"Property asset created successfully! Asset ID: {asset_id}")
+            
+        except Exception as e:
+            st.error(f"Error creating property asset: {str(e)}")
+        finally:
+            conn.close()
 
 
 if __name__ == "__main__":
