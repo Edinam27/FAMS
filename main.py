@@ -2356,11 +2356,20 @@ def restore_backup(backup_file):
         os.remove(temp_file)
         
         
-# Role-based permissions and access control
-
+# Role-based permissions configuration
 ROLE_PERMISSIONS = {
     "admin": {
         "description": "Full system administrator access",
+        "accessible_modules": [
+            "Dashboard",
+            "Asset Management",
+            "Transactions",
+            "Maintenance",
+            "Reports",
+            "Settings",
+            "User Management",
+            "Movement Requests"
+        ],
         "permissions": {
             "assets": ["view", "create", "edit", "delete", "approve"],
             "transactions": ["view", "create", "approve", "bulk_transfer"],
@@ -2368,28 +2377,35 @@ ROLE_PERMISSIONS = {
             "reports": ["view", "create", "export", "custom"],
             "users": ["view", "create", "edit", "delete"],
             "settings": ["view", "edit"],
-            "audit": ["view", "export"],
             "movement_requests": ["view", "approve", "reject", "create"]
         }
     },
     "management": {
         "description": "Department management access",
+        "accessible_modules": [
+            "Dashboard",
+            "Asset Management",
+            "Transactions",
+            "Maintenance",
+            "Reports",
+            "Movement Requests"
+        ],
         "permissions": {
-            "assets": ["view", "edit", "approve"],
+            "assets": ["view", "edit"],
             "transactions": ["view", "approve"],
             "maintenance": ["view", "approve"],
             "reports": ["view", "export"],
-            "audit": ["view"],
             "movement_requests": ["view", "approve", "reject"]
         }
     },
     "staff": {
         "description": "Regular staff access",
+        "accessible_modules": [
+            "Dashboard",
+            "Movement Requests"
+        ],
         "permissions": {
-            "assets": ["view_assigned"],
-            "transactions": ["view_assigned"],
-            "maintenance": ["view_assigned", "request"],
-            "reports": ["view_basic"],
+            "dashboard": ["view_limited"],
             "movement_requests": ["create", "view_own"]
         }
     }
@@ -2646,19 +2662,24 @@ def reject_movement_request(request_id, get_user_id):
 def show_main_application():
     st.sidebar.title(f"Welcome, {st.session_state.username}")
 
-    # Updated navigation with Movement Requests
-    menu_options = {
+    # Get allowed modules for user's role
+    user_role = st.session_state.user_role
+    allowed_modules = ROLE_PERMISSIONS[user_role]["accessible_modules"]
+
+    # Define all possible menu options
+    all_menu_options = {
         "Dashboard": "📊",
         "Asset Management": "💼",
         "Transactions": "🔄",
         "Maintenance": "🔧",
-        "Movement Requests": "🔄",  # Added Movement Requests
+        "Movement Requests": "🔄",
         "Reports": "📈",
         "Settings": "⚙️",
+        "User Management": "👥"
     }
 
-    if st.session_state.user_role == "admin":
-        menu_options["User Management"] = "👥"
+    # Filter menu options based on user's role
+    menu_options = {k: v for k, v in all_menu_options.items() if k in allowed_modules}
 
     selected_page = st.sidebar.selectbox(
         "Navigation",
@@ -2672,27 +2693,89 @@ def show_main_application():
         st.session_state.user_role = None
         st.rerun()
 
-    # Updated page routing
+    # Page routing with permission checks
     if selected_page == "Dashboard":
-        show_dashboard()
-    elif selected_page == "Asset Management":
+        if user_role == "staff":
+            show_staff_dashboard()
+        else:
+            show_dashboard()
+    elif selected_page == "Asset Management" and check_module_access("Asset Management"):
         show_asset_management()
-    elif selected_page == "Transactions":
+    elif selected_page == "Transactions" and check_module_access("Transactions"):
         show_transactions()
-    elif selected_page == "Maintenance":
+    elif selected_page == "Maintenance" and check_module_access("Maintenance"):
         show_maintenance()
     elif selected_page == "Movement Requests":
         show_movement_requests_page()
-    elif selected_page == "Reports":
+    elif selected_page == "Reports" and check_module_access("Reports"):
         show_reports()
-    elif selected_page == "Settings":
+    elif selected_page == "Settings" and check_module_access("Settings"):
         show_settings()
-    elif selected_page == "User Management" and st.session_state.user_role == "admin":
-        show_user_management()  
+    elif selected_page == "User Management" and check_module_access("User Management"):
+        show_user_management()
         
         
+def check_module_access(module_name):
+    """Check if current user has access to the specified module"""
+    user_role = st.session_state.user_role
+    allowed_modules = ROLE_PERMISSIONS[user_role]["accessible_modules"]
+    return module_name in allowed_modules
+
 
 # Placeholder functions for different pages
+def show_staff_dashboard():
+    """Limited dashboard view for staff users"""
+    st.title("📊 Dashboard")
+    
+    conn = get_database_connection()
+    user_dept = get_user_department(st.session_state.username)
+
+    # Show only department-specific information
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        # Department Assets Count
+        dept_assets = pd.read_sql_query("""
+            SELECT COUNT(*) as count 
+            FROM assets 
+            WHERE department = ? AND status = 'active'
+        """, conn, params=[user_dept]).iloc[0]['count']
+        
+        st.metric("Department Assets", dept_assets)
+
+    with col2:
+        # Pending Movement Requests
+        pending_requests = pd.read_sql_query("""
+            SELECT COUNT(*) as count 
+            FROM movement_requests 
+            WHERE requester_id = ? AND status = 'pending'
+        """, conn, params=[get_user_id(st.session_state.username)]).iloc[0]['count']
+        
+        st.metric("Pending Requests", pending_requests)
+
+    # Show user's recent movement requests
+    st.subheader("My Recent Movement Requests")
+    recent_requests = pd.read_sql_query("""
+        SELECT 
+            mr.requested_date,
+            a.asset_name,
+            mr.requested_department,
+            mr.status
+        FROM movement_requests mr
+        JOIN assets a ON mr.asset_id = a.asset_id
+        WHERE mr.requester_id = ?
+        ORDER BY mr.requested_date DESC
+        LIMIT 5
+    """, conn, params=[get_user_id(st.session_state.username)])
+
+    if not recent_requests.empty:
+        st.dataframe(recent_requests, hide_index=True)
+    else:
+        st.info("No recent movement requests found.")
+
+    conn.close()
+
+
 def show_movement_requests_page():
     st.title("🔄 Movement Requests")
     
